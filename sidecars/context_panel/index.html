@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:ROND,opsz,slnt,wdth,wght@0..100,6..144,-10..0,92..100,100..1000&family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap">
-  <link rel="stylesheet" href="/styles.css?v=1.3.0">
+  <link rel="stylesheet" href="/styles.css?v=1.4.0">
 </head>
 <body>
   <div id="loading" class="loading" aria-live="polite" aria-busy="true">
@@ -64,12 +64,49 @@
         <div id="grid-wrap" class="cell-grid hidden" role="img" aria-label="Proportional context cell grid"></div>
 
         <div class="meta-strip">
-          <div class="meta-item" id="cache-meta">
+          <div class="meta-item clickable-meta" id="cache-meta" role="button" tabindex="0">
             <span id="cache-label" class="meta-label">Last-turn cache</span>
             <span id="cache-val" class="meta-value num">0%</span>
           </div>
           <span id="checkpoint-pill" class="checkpoint-pill num hidden"></span>
         </div>
+      </section>
+
+      <!-- Per-Request Prompt Cache Trajectory -->
+      <section id="cache-section" class="cache-card hidden" aria-label="Per-request prompt cache trajectory">
+        <div class="cache-head">
+          <div class="cache-title-group">
+            <span class="cache-live-dot" aria-hidden="true"></span>
+            <span class="cache-title">Cache hit rate trajectory</span>
+            <span id="cache-req-badge" class="badge num">0 reqs</span>
+          </div>
+          <div class="cache-legend">
+            <span class="legend-item" title="Single request cache hit rate (cache_read_tokens / total_prompt_tokens)">
+              <span class="legend-line solid"></span>Per-req
+            </span>
+            <span class="legend-item" title="Cumulative session cache hit rate up to each request">
+              <span class="legend-line dashed"></span>Session
+            </span>
+          </div>
+        </div>
+
+        <div id="cache-kpi-row" class="cache-kpis num"></div>
+
+        <div id="cache-chart-wrap" class="cache-chart-wrap">
+          <svg id="cache-chart-svg" class="cache-chart-svg" role="img" aria-label="Continuously evolving cache hit rate line chart"></svg>
+        </div>
+
+        <div id="cache-inspect-bar" class="cache-inspect num"></div>
+
+        <details id="sec-cache-reqs" class="cache-reqs" open>
+          <summary class="cache-reqs-head">
+            <svg class="chev" width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg>
+            <span class="cache-reqs-title">Every request</span>
+            <span id="cache-reqs-summary" class="cache-reqs-meta num"></span>
+            <button type="button" id="cache-order-btn" class="order-btn" title="Switch request list sort order">Newest ↓</button>
+          </summary>
+          <div id="cache-req-list" class="cache-req-list"></div>
+        </details>
       </section>
 
       <!-- Breakdown Table -->
@@ -161,6 +198,6 @@
     </div>
   </section>
 
-  <script src="/app.js?v=1.3.0"></script>
+  <script src="/app.js?v=1.4.0"></script>
 </body>
 </html>

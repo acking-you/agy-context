@@ -31,6 +31,10 @@
     snap: null,
     workspaces: [],
     viewMode: localStorage.getItem('context_panel_view') === 'grid' ? 'grid' : 'bar',
+    reqSortDesc: localStorage.getItem('context_panel_req_order') !== 'asc',
+    hoveredReqIndex: null,
+    pinnedReqIndex: null,
+    chartGeom: null,
     fallbackConvId: new URLSearchParams(location.search).get('conversationId') || '',
     expandedInline: new Set(), // 'agent' | 'tools'
     hoverKey: null,
@@ -98,6 +102,47 @@
   function fmtPct(tokens, limit) {
     if (!limit) return '0.0%';
     return `${((tokens / limit) * 100).toFixed(1)}%`;
+  }
+
+  function fmtIdle(sec) {
+    if (sec == null || !Number.isFinite(sec)) return null;
+    if (sec < 60) return `+${sec}s`;
+    if (sec < 3600) {
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return s > 0 ? `+${m}m${s}s` : `+${m}m`;
+    }
+    return `+${(sec / 3600).toFixed(1)}h`;
+  }
+
+  function fmtClock(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function hitRateTier(r) {
+    if (!r) return 'cold';
+    if (r.cachedTokens === 0) {
+      if (r.missReason === 'cold') return 'cold';
+      if (r.missReason === 'ttl') return 'warn';
+      return 'bad';
+    }
+    if (r.hitRatio >= 75) return 'good';
+    if (r.hitRatio >= 35) return 'mid';
+    return 'warn';
+  }
+
+  function reasonBadgeHtml(r) {
+    if (!r || !r.missReason) return '';
+    if (r.missReason === 'cold') return '<span class="reason-pill cold">cold #1</span>';
+    if (r.missReason === 'ttl') {
+      const gap = fmtIdle(r.idleSeconds) || '>=5m';
+      return `<span class="reason-pill ttl" title="Idle gap ${esc(gap)} exceeded ~5m prompt cache TTL">TTL ${esc(gap)}</span>`;
+    }
+    if (r.missReason === 'compacted') return '<span class="reason-pill compacted">compacted</span>';
+    return '<span class="reason-pill miss" title="0% cache read despite warm interval">0% drop</span>';
   }
 
   const OPEN_ICON =
@@ -325,6 +370,286 @@
     }
     $('deferred-divider').classList.toggle('hidden', defRows.length === 0);
     $('rows-deferred').innerHTML = defRows.join('');
+  }
+
+  function renderCacheTrajectory(snap) {
+    const sec = $('cache-section');
+    const cache = snap.cache || {};
+    const requests = Array.isArray(cache.requests) ? cache.requests : [];
+    if (requests.length === 0) {
+      sec.classList.add('hidden');
+      state.chartGeom = null;
+      return;
+    }
+    sec.classList.remove('hidden');
+
+    const N = requests.length;
+    if (state.pinnedReqIndex != null && state.pinnedReqIndex > N) {
+      state.pinnedReqIndex = null;
+    }
+    if (state.hoveredReqIndex != null && state.hoveredReqIndex > N) {
+      state.hoveredReqIndex = null;
+    }
+
+    $('cache-req-badge').textContent = `${N} ${N === 1 ? 'req' : 'reqs'}`;
+
+    const latest = requests[N - 1];
+    const latestTier = hitRateTier(latest);
+    const sessRatio = typeof cache.sessionCacheHitRatio === 'number' ? cache.sessionCacheHitRatio : 0;
+    const warmRatio = typeof cache.warmCacheHitRatio === 'number' ? cache.warmCacheHitRatio : 0;
+    const hitReqs = cache.hitRequests ?? requests.filter((r) => r.cachedTokens > 0).length;
+    const zeroReqs = N - hitReqs;
+    const ttlMisses = cache.ttlMissRequests ?? 0;
+    const unexpMisses = cache.unexpectedMissRequests ?? 0;
+
+    const missBreakdown = [];
+    if (N >= 1 && requests[0].missReason === 'cold') missBreakdown.push('1 cold');
+    if (ttlMisses > 0) missBreakdown.push(`${ttlMisses} TTL`);
+    if (unexpMisses > 0) missBreakdown.push(`${unexpMisses} drop`);
+    const missSub = missBreakdown.length ? missBreakdown.join(' · ') : '0 drops';
+
+    $('cache-kpi-row').innerHTML = `
+      <div class="kpi-box" title="Latest request (#${latest.reqIndex}) cache hit ratio">
+        <span class="kpi-label">Latest #${latest.reqIndex}</span>
+        <span class="kpi-val ${latestTier === 'good' ? 'good' : latestTier === 'bad' ? 'bad' : latestTier === 'warn' ? 'warn' : ''}">${latest.hitRatio.toFixed(1)}%</span>
+        <span class="kpi-sub">${fmtTok(latest.cachedTokens)} / ${fmtTok(latest.promptTokens)}</span>
+      </div>
+      <div class="kpi-box" title="Whole-conversation cumulative cache hit ratio across all ${N} requests">
+        <span class="kpi-label">Session total</span>
+        <span class="kpi-val ${sessRatio >= 70 ? 'good' : sessRatio > 0 ? '' : ''}">${sessRatio.toFixed(1)}%</span>
+        <span class="kpi-sub">${fmtTok(cache.cumulativeCachedTokens || 0)} cached</span>
+      </div>
+      <div class="kpi-box" title="Cache hit ratio across requests #2..#${N} (excluding initial cold request #1)">
+        <span class="kpi-label">Warm (#2+)</span>
+        <span class="kpi-val ${N > 1 && warmRatio >= 75 ? 'good' : ''}">${N > 1 ? `${warmRatio.toFixed(1)}%` : '—'}</span>
+        <span class="kpi-sub">${N > 1 ? `peak ${(cache.peakHitRatio || 0).toFixed(1)}%` : 'awaiting #2'}</span>
+      </div>
+      <div class="kpi-box" title="Requests with cache hit vs 0% cache read (${esc(missSub)})">
+        <span class="kpi-label">Hits / Misses</span>
+        <span class="kpi-val ${unexpMisses > 0 ? 'warn' : ''}">${hitReqs} / ${zeroReqs}</span>
+        <span class="kpi-sub">${esc(missSub)}</span>
+      </div>
+    `;
+
+    // Build responsive 1:1 SVG chart
+    const wrap = $('cache-chart-wrap');
+    const W = Math.max(240, Math.round(wrap.clientWidth || 336));
+    const H = 134;
+    const padL = 30;
+    const padR = 10;
+    const padT = 10;
+    const padB = 20;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    const xOf = (idx) => (N === 1 ? padL + plotW / 2 : padL + (idx / (N - 1)) * plotW);
+    const yOf = (pct) => padT + (1 - Math.max(0, Math.min(100, pct)) / 100) * plotH;
+
+    state.chartGeom = { W, H, padL, padR, padT, padB, plotW, plotH, requests, xOf, yOf };
+
+    const y100 = yOf(100).toFixed(1);
+    const y50 = yOf(50).toFixed(1);
+    const y0 = yOf(0).toFixed(1);
+
+    const reqPts = requests.map((r, i) => `${xOf(i).toFixed(1)},${yOf(r.hitRatio).toFixed(1)}`).join(' ');
+    const cumPts = requests.map((r, i) => `${xOf(i).toFixed(1)},${yOf(r.cumulativeHitRatio).toFixed(1)}`).join(' ');
+    const areaPts = N > 1
+      ? `${xOf(0).toFixed(1)},${y0} ${reqPts} ${xOf(N - 1).toFixed(1)},${y0}`
+      : '';
+
+    const userTurnLines = requests
+      .map((r, i) => {
+        if (i === 0 || !r.isUserTurnStart) return '';
+        const x = xOf(i).toFixed(1);
+        return `<line x1="${x}" y1="${padT}" x2="${x}" y2="${y0}" stroke="var(--c-messages)" stroke-opacity="0.22" stroke-width="1" stroke-dasharray="2 2.5"/>`;
+      })
+      .join('');
+
+    const dense = N > 48;
+    const dotsHtml = requests
+      .map((r, i) => {
+        const isLast = i === N - 1;
+        const isNotable = Boolean(r.missReason) || isLast;
+        if (dense && !isNotable && !r.isUserTurnStart) return '';
+        const cx = xOf(i).toFixed(1);
+        const cy = yOf(r.hitRatio).toFixed(1);
+        let fill = 'var(--c-cache-hit)';
+        let stroke = 'var(--cx-surface)';
+        let rad = dense ? 2.2 : 2.8;
+        if (r.missReason === 'cold') {
+          fill = 'var(--cx-surface)';
+          stroke = 'var(--cx-fg-muted)';
+          rad = 2.8;
+        } else if (r.missReason === 'ttl') {
+          fill = 'var(--c-cache-ttl)';
+          rad = 3.2;
+        } else if (r.missReason === 'miss') {
+          fill = 'var(--c-cache-miss)';
+          rad = 3.3;
+        } else if (r.missReason === 'compacted') {
+          fill = 'var(--c-mcp)';
+          rad = 3.2;
+        }
+        const halo = isLast
+          ? `<circle cx="${cx}" cy="${cy}" r="6" fill="color-mix(in srgb, ${fill} 24%, transparent)"/>`
+          : '';
+        return `${halo}<circle cx="${cx}" cy="${cy}" r="${rad}" fill="${fill}" stroke="${stroke}" stroke-width="1.2"/>`;
+      })
+      .join('');
+
+    const xAxisLabels = [];
+    if (N === 1) {
+      xAxisLabels.push(`<text x="${xOf(0).toFixed(1)}" y="${H - 4}" text-anchor="middle" class="chart-axis-text">#1</text>`);
+    } else {
+      xAxisLabels.push(`<text x="${padL}" y="${H - 4}" text-anchor="start" class="chart-axis-text">#1</text>`);
+      if (N >= 5) {
+        const midIdx = Math.floor((N - 1) / 2);
+        xAxisLabels.push(`<text x="${xOf(midIdx).toFixed(1)}" y="${H - 4}" text-anchor="middle" class="chart-axis-text">#${requests[midIdx].reqIndex}</text>`);
+      }
+      xAxisLabels.push(`<text x="${W - padR}" y="${H - 4}" text-anchor="end" class="chart-axis-text">#${N}</text>`);
+    }
+
+    const svg = $('cache-chart-svg');
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.innerHTML = `
+      <defs>
+        <linearGradient id="cacheHitArea" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="var(--c-cache-hit)" stop-opacity="0.24"/>
+          <stop offset="100%" stop-color="var(--c-cache-hit)" stop-opacity="0.01"/>
+        </linearGradient>
+      </defs>
+      <line x1="${padL}" y1="${y100}" x2="${W - padR}" y2="${y100}" stroke="var(--cx-border)" stroke-dasharray="2.5 2.5"/>
+      <line x1="${padL}" y1="${y50}" x2="${W - padR}" y2="${y50}" stroke="var(--cx-border)" stroke-dasharray="2.5 2.5"/>
+      <line x1="${padL}" y1="${y0}" x2="${W - padR}" y2="${y0}" stroke="var(--cx-border)"/>
+      <text x="${padL - 5}" y="${Number(y100) + 3}" text-anchor="end" class="chart-axis-text">100%</text>
+      <text x="${padL - 5}" y="${Number(y50) + 3}" text-anchor="end" class="chart-axis-text">50%</text>
+      <text x="${padL - 5}" y="${Number(y0) + 3}" text-anchor="end" class="chart-axis-text">0%</text>
+      ${userTurnLines}
+      ${areaPts ? `<polygon points="${areaPts}" fill="url(#cacheHitArea)"/>` : ''}
+      ${N > 1 ? `<polyline points="${cumPts}" fill="none" stroke="var(--c-cache-cum)" stroke-width="1.4" stroke-dasharray="3.5 2.5" opacity="0.85" stroke-linejoin="round" stroke-linecap="round"/>` : ''}
+      ${N > 1 ? `<polyline points="${reqPts}" fill="none" stroke="var(--c-cache-hit)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` : ''}
+      ${dotsHtml}
+      <line id="cache-crosshair" x1="0" y1="${padT}" x2="0" y2="${y0}" stroke="var(--cx-fg-muted)" stroke-opacity="0.45" stroke-width="1" stroke-dasharray="2 2" class="hidden"/>
+      <circle id="cache-focus-cum" cx="0" cy="0" r="3" fill="var(--c-cache-cum)" stroke="var(--cx-surface)" stroke-width="1.2" class="hidden"/>
+      <circle id="cache-focus-req" cx="0" cy="0" r="4.2" fill="var(--c-cache-hit)" stroke="var(--cx-surface)" stroke-width="1.6" class="hidden"/>
+      ${xAxisLabels.join('')}
+    `;
+
+    // Render full per-request list (preserving scrollTop)
+    const listEl = $('cache-req-list');
+    const prevScroll = listEl.scrollTop;
+    const maxPrompt = Math.max(1, ...requests.map((r) => r.promptTokens));
+    const ordered = state.reqSortDesc ? [...requests].reverse() : requests;
+
+    $('cache-order-btn').textContent = state.reqSortDesc ? 'Newest ↓' : '#1 → #N ↑';
+    $('cache-reqs-summary').textContent = `${fmtTok(cache.cumulativeCachedTokens || 0)} / ${fmtTok(cache.cumulativeInputTokens || 0)} cached`;
+
+    listEl.innerHTML = ordered
+      .map((r) => {
+        const tier = hitRateTier(r);
+        const totalWidthPct = Math.max(4, Math.min(100, (r.promptTokens / maxPrompt) * 100));
+        const cachedSharePct = r.promptTokens > 0 ? (r.cachedTokens / r.promptTokens) * 100 : 0;
+        const uncachedSharePct = Math.max(0, 100 - cachedSharePct);
+        const uncachedCls = r.missReason === 'miss' ? ' miss' : r.missReason === 'ttl' ? ' ttl' : '';
+        const uBadge = r.isUserTurnStart ? `<span class="uturn-pill" title="User message #${r.userTurn}">U${r.userTurn}</span>` : '';
+        let rightLabel = `${fmtTok(r.cachedTokens)}/${fmtTok(r.promptTokens)}`;
+        if (r.cachedTokens === 0) {
+          if (r.missReason === 'cold') rightLabel = `cold · ${fmtTok(r.promptTokens)}`;
+          else if (r.missReason === 'ttl') rightLabel = `TTL · ${fmtTok(r.promptTokens)}`;
+          else if (r.missReason === 'compacted') rightLabel = `cmp · ${fmtTok(r.promptTokens)}`;
+          else rightLabel = `drop · ${fmtTok(r.promptTokens)}`;
+        }
+        return `
+          <div class="req-row" data-req-index="${r.reqIndex}">
+            <span class="req-id-cell">#${r.reqIndex}${uBadge}</span>
+            <span class="req-bar-track" title="#${r.reqIndex}: ${fmtTok(r.cachedTokens)} cached + ${fmtTok(r.uncachedTokens)} uncached = ${fmtTok(r.promptTokens)} prompt">
+              <span class="req-bar-total" style="width:${totalWidthPct.toFixed(1)}%">
+                <span class="req-bar-cached" style="width:${cachedSharePct.toFixed(1)}%"></span>
+                <span class="req-bar-uncached${uncachedCls}" style="width:${uncachedSharePct.toFixed(1)}%"></span>
+              </span>
+            </span>
+            <span class="req-pct-cell ${tier}">${r.hitRatio.toFixed(1)}%</span>
+            <span class="req-tok-cell">${esc(rightLabel)}</span>
+          </div>
+        `;
+      })
+      .join('');
+
+    listEl.scrollTop = prevScroll;
+    updateCacheFocus();
+  }
+
+  function updateCacheFocus() {
+    const g = state.chartGeom;
+    if (!g || !g.requests.length) return;
+    const N = g.requests.length;
+    const targetReqIndex = state.hoveredReqIndex ?? state.pinnedReqIndex ?? N;
+    const idx = Math.max(0, Math.min(N - 1, targetReqIndex - 1));
+    const r = g.requests[idx];
+
+    const cx = g.xOf(idx).toFixed(1);
+    const cyReq = g.yOf(r.hitRatio).toFixed(1);
+    const cyCum = g.yOf(r.cumulativeHitRatio).toFixed(1);
+
+    const cross = $('cache-crosshair');
+    const dotReq = $('cache-focus-req');
+    const dotCum = $('cache-focus-cum');
+    if (cross && dotReq && dotCum) {
+      cross.setAttribute('x1', cx);
+      cross.setAttribute('x2', cx);
+      cross.classList.remove('hidden');
+
+      dotReq.setAttribute('cx', cx);
+      dotReq.setAttribute('cy', cyReq);
+      const tier = hitRateTier(r);
+      const focusColor =
+        tier === 'bad'
+          ? 'var(--c-cache-miss)'
+          : tier === 'warn'
+            ? 'var(--c-cache-ttl)'
+            : tier === 'cold'
+              ? 'var(--cx-fg-muted)'
+              : 'var(--c-cache-hit)';
+      dotReq.setAttribute('fill', focusColor);
+      dotReq.classList.remove('hidden');
+
+      if (N > 1) {
+        dotCum.setAttribute('cx', cx);
+        dotCum.setAttribute('cy', cyCum);
+        dotCum.classList.remove('hidden');
+      } else {
+        dotCum.classList.add('hidden');
+      }
+    }
+
+    const tier = hitRateTier(r);
+    const clock = fmtClock(r.createdAt);
+    const idle = fmtIdle(r.idleSeconds);
+    const toolsText = r.toolCount > 0
+      ? `${r.toolCount} ${r.toolCount === 1 ? 'tool' : 'tools'} (${r.toolNames.slice(0, 2).join(', ')}${r.toolCount > 2 ? '…' : ''})`
+      : 'reply';
+    const isPinned = state.pinnedReqIndex === r.reqIndex;
+
+    $('cache-inspect-bar').innerHTML = `
+      <div class="inspect-left">
+        <span class="inspect-req">#${r.reqIndex}</span>
+        ${r.isUserTurnStart ? `<span class="uturn-pill">User #${r.userTurn}</span>` : ''}
+        <span class="inspect-muted">step ${r.stepIndex}</span>
+        ${clock ? `<span class="inspect-muted">· ${esc(clock)}</span>` : ''}
+        ${idle ? `<span class="inspect-muted">· Δt ${esc(idle)}</span>` : ''}
+        <span class="inspect-muted">· ${esc(toolsText)}</span>
+        ${isPinned ? '<span class="pin-tag" title="Click chart or row again to unpin">pinned</span>' : ''}
+      </div>
+      <div class="inspect-right">
+        ${reasonBadgeHtml(r)}
+        <span class="inspect-hit ${tier}">${r.hitRatio.toFixed(1)}%</span>
+        <span class="inspect-muted">(${fmtTok(r.cachedTokens)} hit + ${fmtTok(r.uncachedTokens)} new = ${fmtTok(r.promptTokens)} · cum ${r.cumulativeHitRatio.toFixed(1)}%)</span>
+      </div>
+    `;
+
+    document.querySelectorAll('#cache-req-list .req-row').forEach((el) => {
+      el.classList.toggle('active', Number(el.dataset.reqIndex) === r.reqIndex);
+    });
   }
 
   function renderDetails(snap) {
@@ -628,6 +953,7 @@
     }
 
     renderVisuals(snap);
+    renderCacheTrajectory(snap);
     renderCategoryRows(snap);
     renderDetails(snap);
   }
@@ -687,6 +1013,69 @@
     if (state.snap) renderVisuals(state.snap);
   });
 
+  function resolveChartReqFromPointer(clientX) {
+    const g = state.chartGeom;
+    if (!g || !g.requests.length) return null;
+    const rect = $('cache-chart-svg').getBoundingClientRect();
+    if (!rect.width) return null;
+    const relX = ((clientX - rect.left) / rect.width) * g.W;
+    if (g.requests.length === 1) return 1;
+    const ratio = Math.max(0, Math.min(1, (relX - g.padL) / g.plotW));
+    const idx = Math.round(ratio * (g.requests.length - 1));
+    return g.requests[idx]?.reqIndex ?? null;
+  }
+
+  const chartWrapEl = $('cache-chart-wrap');
+  chartWrapEl.addEventListener('mousemove', (e) => {
+    const reqIdx = resolveChartReqFromPointer(e.clientX);
+    if (reqIdx != null && reqIdx !== state.hoveredReqIndex) {
+      state.hoveredReqIndex = reqIdx;
+      updateCacheFocus();
+    }
+  });
+  chartWrapEl.addEventListener('mouseleave', () => {
+    if (state.hoveredReqIndex != null) {
+      state.hoveredReqIndex = null;
+      updateCacheFocus();
+    }
+  });
+  chartWrapEl.addEventListener('click', (e) => {
+    const reqIdx = resolveChartReqFromPointer(e.clientX);
+    if (reqIdx == null) return;
+    state.pinnedReqIndex = state.pinnedReqIndex === reqIdx ? null : reqIdx;
+    updateCacheFocus();
+    const activeRow = document.querySelector(`#cache-req-list .req-row[data-req-index="${reqIdx}"]`);
+    if (activeRow && state.pinnedReqIndex != null) {
+      activeRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  });
+
+  $('cache-order-btn').addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    state.reqSortDesc = !state.reqSortDesc;
+    localStorage.setItem('context_panel_req_order', state.reqSortDesc ? 'desc' : 'asc');
+    if (state.snap) renderCacheTrajectory(state.snap);
+  });
+
+  $('cache-meta').addEventListener('click', () => {
+    const sec = $('cache-section');
+    if (sec && !sec.classList.contains('hidden')) {
+      sec.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  });
+
+  if (typeof ResizeObserver !== 'undefined') {
+    let lastChartW = 0;
+    new ResizeObserver((entries) => {
+      const w = Math.round(entries[0]?.contentRect?.width || 0);
+      if (w > 0 && Math.abs(w - lastChartW) >= 4) {
+        lastChartW = w;
+        if (state.snap) renderCacheTrajectory(state.snap);
+      }
+    }).observe(chartWrapEl);
+  }
+
   document.addEventListener('click', (e) => {
     const fileBtn = e.target.closest('[data-open-file]');
     if (fileBtn) {
@@ -700,8 +1089,31 @@
       openConversation(convBtn.dataset.openConv);
       return;
     }
+    const reqRow = e.target.closest('#cache-req-list .req-row');
+    if (reqRow) {
+      const reqIdx = Number(reqRow.dataset.reqIndex);
+      if (reqIdx > 0) {
+        state.pinnedReqIndex = state.pinnedReqIndex === reqIdx ? null : reqIdx;
+        updateCacheFocus();
+      }
+      return;
+    }
     const row = e.target.closest('.cat-row.clickable');
     if (row) activateClickableRow(row);
+  });
+
+  document.addEventListener('mouseover', (e) => {
+    const reqRow = e.target.closest('#cache-req-list .req-row');
+    if (reqRow) {
+      const reqIdx = Number(reqRow.dataset.reqIndex);
+      if (reqIdx > 0 && reqIdx !== state.hoveredReqIndex) {
+        state.hoveredReqIndex = reqIdx;
+        updateCacheFocus();
+      }
+    } else if (state.hoveredReqIndex != null && !e.target.closest('#cache-chart-wrap')) {
+      state.hoveredReqIndex = null;
+      updateCacheFocus();
+    }
   });
 
   document.addEventListener('keydown', (e) => {

@@ -1263,18 +1263,27 @@ export async function analyzeConversation(appData, convId, options = {}) {
   const transcriptMtime = Math.max(fullStat.mtime || 0, compactStat.mtime || 0);
   const transcriptSize = Math.max(0, fullStat.size) + Math.max(0, compactStat.size);
 
-  // Scan chronologically for PLANNER_RESPONSE steps and explicit CHECKPOINT compactions
+  // Scan chronologically for PLANNER_RESPONSE steps, USER_INPUT boundaries, and explicit CHECKPOINT compactions
   const plannerIndices = [];
   const checkpoints = [];
   const turnsHistory = [];
+  const cacheRequests = [];
   let lastCompactionStepIdx = -1;
   let lastCheckpointSummaryTokens = 0;
   let sawExplicitCheckpointSinceLastPlanner = false;
   let lastPlannerIdxSoFar = -1;
+  let userTurnCounter = 0;
+  let sawUserSinceLastPlanner = false;
+  let runningPromptTokens = 0;
+  let runningCachedTokens = 0;
+  let prevPlannerAtMs = null;
 
   for (let i = 0; i < steps.length; i++) {
     const s = steps[i];
-    if (s.type === 'CHECKPOINT') {
+    if (s.type === 'USER_INPUT') {
+      userTurnCounter += 1;
+      sawUserSinceLastPlanner = true;
+    } else if (s.type === 'CHECKPOINT') {
       const cpPrompt = (s.input_tokens || 0) + (s.cache_read_tokens || 0);
       let prevPlannerTotal = 0;
       if (lastPlannerIdxSoFar >= 0) {
@@ -1334,18 +1343,57 @@ export async function analyzeConversation(appData, convId, options = {}) {
             });
           }
         }
-        plannerIndices.push(i);
-        lastPlannerIdxSoFar = i;
-        turnsHistory.push({
+        const reqIndex = cacheRequests.length + 1;
+        const wasCompacted = sawExplicitCheckpointSinceLastPlanner || implicitDrop;
+        runningPromptTokens += promptTokens;
+        runningCachedTokens += cache;
+        const hitRatio = Number(((cache / promptTokens) * 100).toFixed(1));
+        const cumulativeHitRatio = Number(((runningCachedTokens / runningPromptTokens) * 100).toFixed(1));
+
+        const curAtMs = s.created_at ? Date.parse(s.created_at) : NaN;
+        const idleSeconds =
+          prevPlannerAtMs != null && Number.isFinite(curAtMs) && curAtMs >= prevPlannerAtMs
+            ? Math.round((curAtMs - prevPlannerAtMs) / 1000)
+            : null;
+        if (Number.isFinite(curAtMs)) prevPlannerAtMs = curAtMs;
+
+        let missReason = null;
+        if (cache === 0) {
+          if (reqIndex === 1) missReason = 'cold';
+          else if (wasCompacted) missReason = 'compacted';
+          else if (idleSeconds != null && idleSeconds >= 300) missReason = 'ttl';
+          else missReason = 'miss';
+        }
+
+        const rawToolCalls = Array.isArray(s.tool_calls) ? s.tool_calls : [];
+        const toolNames = rawToolCalls.slice(0, 4).map((tc) => tc?.name || 'tool');
+
+        const reqEntry = {
+          reqIndex,
           stepIndex: s.step_index ?? i,
+          userTurn: Math.max(1, userTurnCounter),
+          isUserTurnStart: sawUserSinceLastPlanner || reqIndex === 1,
           promptTokens,
           uncachedTokens: inp,
           cachedTokens: cache,
           outputTokens,
+          hitRatio,
+          cumulativeHitRatio,
+          idleSeconds,
+          missReason,
+          model: typeof s.model === 'string' ? s.model : '',
+          toolCount: rawToolCalls.length,
+          toolNames,
           createdAt: s.created_at || null,
-          compacted: sawExplicitCheckpointSinceLastPlanner || implicitDrop,
-        });
+          compacted: wasCompacted,
+        };
+
+        plannerIndices.push(i);
+        lastPlannerIdxSoFar = i;
+        cacheRequests.push(reqEntry);
+        turnsHistory.push(reqEntry);
         sawExplicitCheckpointSinceLastPlanner = false;
+        sawUserSinceLastPlanner = false;
       }
     }
   }
@@ -1739,6 +1787,27 @@ export async function analyzeConversation(appData, convId, options = {}) {
     ? Number(((cumulativeCachedTokens / cumulativeInputTokens) * 100).toFixed(1))
     : 0;
 
+  const totalRequests = cacheRequests.length;
+  let hitRequests = 0;
+  let ttlMissRequests = 0;
+  let unexpectedMissRequests = 0;
+  let peakHitRatio = 0;
+  let warmInputTokens = 0;
+  let warmCachedTokens = 0;
+  for (const r of cacheRequests) {
+    if (r.cachedTokens > 0) hitRequests += 1;
+    if (r.missReason === 'ttl') ttlMissRequests += 1;
+    else if (r.missReason === 'miss') unexpectedMissRequests += 1;
+    if (r.hitRatio > peakHitRatio) peakHitRatio = r.hitRatio;
+    if (r.reqIndex > 1) {
+      warmInputTokens += r.promptTokens;
+      warmCachedTokens += r.cachedTokens;
+    }
+  }
+  const warmCacheHitRatio = warmInputTokens > 0
+    ? Number(((warmCachedTokens / warmInputTokens) * 100).toFixed(1))
+    : 0;
+
   return {
     conversationId: convId,
     found: true,
@@ -1765,7 +1834,15 @@ export async function analyzeConversation(appData, convId, options = {}) {
       cumulativeInputTokens,
       cumulativeCachedTokens,
       sessionCacheHitRatio,
+      warmCacheHitRatio,
       cumulativeOutputTokens,
+      totalRequests,
+      hitRequests,
+      zeroHitRequests: totalRequests - hitRequests,
+      ttlMissRequests,
+      unexpectedMissRequests,
+      peakHitRatio,
+      requests: cacheRequests,
     },
     compaction: {
       count: checkpoints.length,
